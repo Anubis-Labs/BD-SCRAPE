@@ -1,0 +1,28 @@
+# Core dependencies
+streamlit==1.45.1
+pydantic==2.11.4
+sqlalchemy==2.0.41
+psycopg2-binary==2.9.10
+
+# Document parsing
+python-pptx==1.0.2
+python-docx==0.8.11
+pdfplumber==0.11.6
+PyMuPDF==1.25.5  # This provides the 'fitz' module
+pandas==2.2.2
+openpyxl==3.1.5
+
+# Utilities
+requests==2.32.3
+reportlab==4.4.1
+python-dateutil==2.9.0.post0
+pytz==2025.2
+tzdata==2024.1
+
+# Optional but recommended
+watchdog==6.0.0  # For file system monitoring
+python-dotenv==1.0.1  # For environment variables
+
+# Add other libraries as needed, for example:
+# ollama # For direct Python bindings to Ollama, if preferred over raw requests
+# PyYAML # For config file parsing if using YAML 
