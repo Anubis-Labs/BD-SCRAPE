@@ -159,28 +159,29 @@ Based on the official schema, please classify this project.
 """
 
     try:
-        response_json = call_ollama(
-            model=llm_model,
-            prompt=prompt,
-            system_prompt=system_prompt,
-            temperature=0.0,
-            json_mode=True,
+        response_data = call_ollama_generate(
+            model_name=llm_model,
+            prompt_text=f"{system_prompt}\n\n{prompt}",
+            temperature=0.0
         )
 
-        if isinstance(response_json, str):
+        if response_data and "response" in response_data:
+            raw_response_str = response_data["response"]
+            logger.info(f"Raw LLM response for categorization: {raw_response_str}")
             # If Ollama returns a string, it's likely a JSON string. Parse it.
             try:
-                response_data = json.loads(response_json)
+                parsed_data = json.loads(_strip_llm_json_markdown(raw_response_str))
             except json.JSONDecodeError:
-                logger.error(f"Failed to decode JSON string from Ollama: {response_json}")
+                logger.error(f"Failed to decode JSON string from Ollama: {raw_response_str}")
                 return {"category": "Uncategorized", "sub_category": "", "project_scope": "Unclassified"}
         else:
-            response_data = response_json
+            logger.warning(f"No valid 'response' in Ollama output. Full response: {response_data}")
+            parsed_data = {}
 
         # Validate the response keys
-        category = response_data.get("category", "Uncategorized")
-        sub_category = response_data.get("sub_category", "")
-        project_scope = response_data.get("project_scope", "Unclassified")
+        category = parsed_data.get("category", "Uncategorized")
+        sub_category = parsed_data.get("sub_category", "")
+        project_scope = parsed_data.get("project_scope", "Unclassified")
 
         logger.info(f"Project successfully categorized as: {category} / {sub_category} / {project_scope}")
         return {"category": category, "sub_category": sub_category, "project_scope": project_scope}

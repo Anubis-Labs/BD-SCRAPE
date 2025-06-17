@@ -1154,6 +1154,8 @@ with st.container():
                     st.session_state.processing_active = True
                     st.session_state.live_logs = []
                     log_queue = Queue()
+                    # Use a single, managed session for the entire batch job
+                    db_session_for_batch = db_manager.get_managed_session("batch_processing")
 
                     user_provided_path = folder_path.strip()
                     logger.info(f"Starting batch processing with model: {model}, folder: {user_provided_path}, workers: {workers}")
@@ -1188,7 +1190,7 @@ with st.container():
                     progress_container = st.empty()
                     status_container = st.empty()
                     
-                    def process_single_doc_worker(file_info, log_queue, db_session):
+                    def process_single_doc(file_info, log_queue):
                         if st.session_state.get('processing_stopped', False):
                             return "Skipped"
                         
@@ -1213,7 +1215,7 @@ with st.container():
                                 selected_llm_model=model,
                                 filename=filename,
                                 upload_dir=directory,
-                                db_session=db_session
+                                db_session=next(db_session_for_batch) # Get the session from the context manager
                             )
                             logger.info(f"Successfully processed: {filename}")
                             return "Success"
@@ -1225,40 +1227,37 @@ with st.container():
                             # Restore the original logging configuration for the root logger
                             root_logger.handlers = original_handlers
 
-                    # Acquire a single session to be shared by all threads in the pool
-                    with db_manager.get_managed_session("batch_processing") as shared_db_session:
-                        with ThreadPoolExecutor(max_workers=workers) as executor:
-                            # Pass the shared session to each worker
-                            future_to_file = {executor.submit(process_single_doc_worker, file_info, log_queue, shared_db_session): file_info for file_info in files_to_process}
-                            
-                            for future in as_completed(future_to_file):
-                                # Process any logs that have been queued from the worker threads
-                                while not log_queue.empty():
-                                    try:
-                                        record = log_queue.get_nowait()
-                                        streamlit_handler.emit(record)
-                                    except Exception as e:
-                                        print(f"Error processing log queue: {e}")
-
-                                if st.session_state.get('processing_stopped', False):
-                                    break
-                                
-                                file_info = future_to_file[future]
-                                filename = file_info["file_path"].name
-                                st.session_state.processed_files_count += 1
-                                
-                                progress = st.session_state.processed_files_count / st.session_state.total_files_to_process
-                                progress_container.progress(progress, text=f"Processing: {filename} ({st.session_state.processed_files_count}/{st.session_state.total_files_to_process})")
-                                
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        future_to_file = {executor.submit(process_single_doc, file_info, log_queue): file_info for file_info in files_to_process}
+                        
+                        for future in as_completed(future_to_file):
+                            # Process any logs that have been queued from the worker threads
+                            while not log_queue.empty():
                                 try:
-                                    result = future.result()
-                                    if result == "Success":
-                                        status_container.success(f"✅ Completed: {filename}", icon="🚀")
-                                    elif result == "Error":
-                                        status_container.warning(f"⚠️ Error processing: {filename}. See logs for details.", icon="🔥")
-                                except Exception as exc:
-                                    logger.error(f'{filename} generated an exception: {exc}')
-                                    status_container.error(f"❌ Critical error processing {filename}. Check logs.")
+                                    record = log_queue.get_nowait()
+                                    streamlit_handler.emit(record)
+                                except Exception as e:
+                                    print(f"Error processing log queue: {e}")
+
+                            if st.session_state.get('processing_stopped', False):
+                                break
+                            
+                            file_info = future_to_file[future]
+                            filename = file_info["file_path"].name
+                            st.session_state.processed_files_count += 1
+                            
+                            progress = st.session_state.processed_files_count / st.session_state.total_files_to_process
+                            progress_container.progress(progress, text=f"Processing: {filename} ({st.session_state.processed_files_count}/{st.session_state.total_files_to_process})")
+                            
+                            try:
+                                result = future.result()
+                                if result == "Success":
+                                    status_container.success(f"✅ Completed: {filename}", icon="🚀")
+                                elif result == "Error":
+                                    status_container.warning(f"⚠️ Error processing: {filename}. See logs for details.", icon="🔥")
+                            except Exception as exc:
+                                logger.error(f'{filename} generated an exception: {exc}')
+                                status_container.error(f"❌ Critical error processing {filename}. Check logs.")
 
                     st.session_state.processing_active = False
                     total_processed = st.session_state.processed_files_count
