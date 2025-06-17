@@ -142,24 +142,29 @@ def process_single_file(db_session: Session, llm_model: str, file_path: Path):
             # Call the new LLM handler function
             categorization_result = llm_handler.categorize_project(llm_model, full_project_data)
 
-            # Get the project ID to perform the update
+            # Get the project object to perform the update directly
             project = db_session.query(database_crud.Project).filter_by(project_name=project_name).first()
             if not project:
                 logger.error(f"Logic error: Could not find project '{project_name}' in database for category update.")
                 continue
 
-            # Update the database with the new categories
-            database_crud.update_project_categorization(
-                session=db_session,
-                project_id=project.project_id,
-                category=categorization_result.get("category"),
-                sub_category=categorization_result.get("sub_category"),
-                project_scope=categorization_result.get("project_scope"),
-            )
-            logger.info(f"Successfully categorized and updated project: {project_name}")
+            # Directly update the project object attributes
+            project.category = categorization_result.get("category", "Uncategorized")
+            project.sub_category = categorization_result.get("sub_category", "")
+            project.project_scope = categorization_result.get("project_scope", "Unclassified")
+
+            logger.info(f"Successfully categorized project: {project_name}. Changes will be committed.")
 
         except Exception as e:
             logger.error(f"An error occurred during categorization for project '{project_name}': {e}", exc_info=True)
+
+    # Commit all changes for all projects touched in this file at the very end
+    try:
+        db_session.commit()
+        logger.info(f"Successfully committed all snippet and category updates for file {file_path.name}.")
+    except Exception as e:
+        logger.error(f"Failed to commit changes to the database for file {file_path.name}: {e}", exc_info=True)
+        db_session.rollback()
 
 def process_documents(
     selected_llm_model: str,
