@@ -7,8 +7,11 @@ import sys
 import os
 from pathlib import Path
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
+# Correctly add project root to the path, so both 'src' and 'scripts' can be found
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / 'src')) # Ensure src is also in path for nested imports
+sys.path.insert(0, str(project_root / 'scripts')) # And scripts
 
 def test_database_manager():
     """Test the DatabaseManager class"""
@@ -86,10 +89,11 @@ def test_imports():
     print("\n📦 Testing imports...")
     
     modules_to_test = [
-        'database_manager',
-        'docker_db_manager',
+        'scripts.database_manager',
+        'scripts.docker_db_manager',
         'src.database_crud',
-        'src.database_models'
+        'src.database_models',
+        'src.gui.database_management_ui'
     ]
     
     success_count = 0
@@ -100,7 +104,8 @@ def test_imports():
             print(f"✅ {module} imported successfully")
             success_count += 1
         except ImportError as e:
-            print(f"❌ Failed to import {module}: {e}")
+            # Add a more descriptive error message
+            print(f"❌ Failed to import {module}: {e}. Current sys.path: {sys.path}")
     
     print(f"\n📊 Import test results: {success_count}/{len(modules_to_test)} modules imported successfully")
     return success_count == len(modules_to_test)

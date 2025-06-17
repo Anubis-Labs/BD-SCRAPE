@@ -13,6 +13,8 @@ import platform
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from sqlalchemy import text
+import time
 
 class EnvironmentSetup:
     """Comprehensive environment setup and verification."""
@@ -257,6 +259,26 @@ class EnvironmentSetup:
             self.log("Docker services startup timed out", "ERROR")
             return False
             
+    def initialize_database(self) -> bool:
+        """Create database tables."""
+        self.log("Initializing database...")
+        
+        try:
+            sys.path.insert(0, str(self.project_root / "src"))
+            from database_models import get_db_engine, create_tables
+            
+            # Short delay to ensure postgres is ready
+            time.sleep(5)
+            
+            engine = get_db_engine()
+            create_tables(engine)
+            self.log("Database tables created successfully")
+            return True
+            
+        except Exception as e:
+            self.log(f"Database initialization failed: {e}", "ERROR")
+            return False
+            
     def verify_services(self) -> bool:
         """Verify that services are running correctly."""
         self.log("Verifying services...")
@@ -264,11 +286,12 @@ class EnvironmentSetup:
         try:
             # Test database connection
             sys.path.insert(0, str(self.project_root / "src"))
-            from database_crud import get_db_session
+            from sqlalchemy import text
+            from database_crud import get_session
             
-            with get_db_session() as session:
+            with get_session() as session:
                 # Simple query to test connection
-                session.execute("SELECT 1")
+                session.execute(text("SELECT 1"))
                 self.log("Database connection - OK")
                 
         except Exception as e:
@@ -402,6 +425,7 @@ class EnvironmentSetup:
             ("Installing requirements", self.install_requirements),
             ("Setting up environment file", self.setup_environment_file),
             ("Starting Docker services", self.start_docker_services),
+            ("Initializing database", self.initialize_database),
             ("Verifying services", self.verify_services),
             ("Pulling default AI model", self.pull_default_model),
             ("Running system tests", self.run_tests)

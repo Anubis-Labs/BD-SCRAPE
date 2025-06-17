@@ -4,146 +4,251 @@ import sys
 import logging
 from datetime import datetime
 from pathlib import Path
-import html  # Add this import at the top with other imports
+import html
 import json
 import base64
 import time
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+import pandas as pd
 
-# Add src directory to Python path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from main_processor import process_documents
-from llm_handler import get_available_ollama_models
-from database_crud import (
-    get_db_connection_status, get_primary_sectors, get_project_sub_categories, 
-    get_project_statuses,
-    get_simple_project_list,
-    get_comprehensive_project_list,
-    get_projects_for_display,
-    get_documents_for_project,
-    get_key_info_for_document,
-    get_project_extraction_logs,
-    get_session,
-    get_processed_documents
+# --- Streamlit Page Configuration ---
+# MUST be the first Streamlit command called.
+st.set_page_config(
+    page_title="Equinox Document Intelligence Processor", 
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
-from file_system_handler import list_files_in_upload_folder, clear_upload_folder, get_file_stats, UPLOAD_FOLDER, find_project_files
 
-# Import database management UI
-try:
-    from database_management_ui import render_database_management_ui
-    DATABASE_MANAGEMENT_AVAILABLE = True
-except ImportError as e:
-    DATABASE_MANAGEMENT_AVAILABLE = False
-    print(f"Database management UI not available: {e}")
+# Initialize session state variables at the very top
+if 'live_logs' not in st.session_state:
+    st.session_state.live_logs = []
+if 'log_counter' not in st.session_state:
+    st.session_state.log_counter = 0
 
 # --- Enhanced Real-Time Logging System ---
+class QueueLogHandler(logging.Handler):
+    """A logging handler that puts records into a queue."""
+    def __init__(self, log_queue: Queue):
+        super().__init__()
+        self.log_queue = log_queue
+
+    def emit(self, record):
+        self.log_queue.put(record)
+
 class AdvancedStreamlitLogHandler(logging.Handler):
     def __init__(self, level=logging.NOTSET):
         super().__init__(level)
-        if 'live_logs' not in st.session_state:
-            st.session_state.live_logs = []
-        if 'log_counter' not in st.session_state:
-            st.session_state.log_counter = 0
 
     def emit(self, record):
         log_entry = self.format(record)
         st.session_state.log_counter += 1
         
-        # Enhanced log entry with styling
         enhanced_log = {
             "id": st.session_state.log_counter,
             "level": record.levelname,
             "msg": log_entry,
-            "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],  # Include milliseconds
+            "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
             "module": record.name,
             "raw_message": record.getMessage()
         }
         
         st.session_state.live_logs.append(enhanced_log)
         
-        # Keep only last 150 logs for performance
         if len(st.session_state.live_logs) > 150:
             st.session_state.live_logs = st.session_state.live_logs[-150:]
         
-        # Force immediate update during processing
         if st.session_state.get('processing_active', False):
-            # Use session state to trigger updates without full rerun
             st.session_state.last_log_update = datetime.now().timestamp()
-
 
 # Configure root logger
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-# Get root logger
 logger = logging.getLogger() 
-logger.setLevel(logging.INFO) # Set global logging level
+logger.setLevel(logging.INFO)
 
-# Remove existing handlers to avoid duplicate logs in console if any were auto-configured
 for handler in logger.handlers[:]:
     logger.removeHandler(handler)
 
-# Add Streamlit handler
 streamlit_handler = AdvancedStreamlitLogHandler()
 streamlit_handler.setFormatter(log_formatter)
 logger.addHandler(streamlit_handler)
 
-# Add console handler for debugging in terminal
-console_handler = logging.StreamHandler(sys.stdout) # Use sys.stdout
+console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
-# ENHANCED LOGGING SETUP - Ensure all module loggers are captured
 module_loggers = [
-    'main_processor',
-    'llm_handler', 
-    'database_crud',
-    'file_system_handler',
-    'src.main_processor',
-    'src.llm_handler',
-    'src.database_crud', 
-    'src.file_system_handler',
-    '__main__'
+    'main_processor', 'llm_handler', 'database_crud', 'file_system_handler',
+    'src.main_processor', 'src.llm_handler', 'src.database_crud', 
+    'src.file_system_handler', '__main__'
 ]
 
 for module_name in module_loggers:
     module_logger = logging.getLogger(module_name)
     module_logger.setLevel(logging.INFO)
-    # Add handlers to each module logger to ensure capture
     if streamlit_handler not in module_logger.handlers:
         module_logger.addHandler(streamlit_handler)
     if console_handler not in module_logger.handlers:
         module_logger.addHandler(console_handler)
-    # Ensure propagation to root logger
     module_logger.propagate = True
 
-# Force all loggers to propagate to root
-logging.getLogger().propagate = True
-
-# Set logging level for common third-party libraries to reduce noise
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 logging.getLogger('streamlit').setLevel(logging.WARNING)
 
-# Only log initialization once to prevent spam
 if 'logging_initialized' not in st.session_state:
     logger.info("🔧 Enhanced logging system initialized - capturing all module logs")
     st.session_state.logging_initialized = True
-# --- End Custom Logging Setup ---
 
-# --- Streamlit Page Configuration ---
-st.set_page_config(
-    page_title="Equinox Document Intelligence Processor", 
-    layout="wide",
-    initial_sidebar_state="expanded"  # Show sidebar by default to display all new features
+from src.main_processor import process_documents
+from src.llm_handler import get_available_ollama_models
+from src.db_logic import (
+    get_db_connection_status,
+    get_session,
+    get_all_project_names,
+    get_project_data
 )
+from src.database_models import create_tables, get_db_engine, Project
+from sqlalchemy import inspect
+from src.file_system_handler import list_files_in_upload_folder, clear_upload_folder, get_file_stats, UPLOAD_FOLDER, find_project_files
 
-# Disable automatic rerun on file changes and reduce refresh frequency
-# This helps prevent the dimming screen during processing
-if hasattr(st, 'config'):
-    try:
-        st.config.set_option('global.developmentMode', False)
-        st.config.set_option('server.runOnSave', False)
-    except:
-        pass  # Ignore if options don't exist in this Streamlit version
+# --- DATABASE INITIALIZATION CHECK ---
+def ensure_database_initialized():
+    """
+    Checks if the database tables exist and creates them if they don't.
+    This makes the app more robust and removes dependency on running setup scripts.
+    """
+    if 'db_initialized' not in st.session_state or not st.session_state.db_initialized:
+        try:
+            logger.info("Verifying database initialization...")
+            engine = get_db_engine()
+            inspector = inspect(engine)
+            
+            if not inspector.has_table("Projects"):
+                logger.warning("Database tables not found! Initializing database...")
+                st.toast("🔧 First-time setup: Initializing database tables...", icon="🎉")
+                create_tables(engine)
+                logger.info("✅ Database tables created successfully.")
+                st.toast("✅ Database ready!", icon="🚀")
+                st.session_state.db_initialized = True
+            else:
+                logger.info("Database is already initialized.")
+                st.session_state.db_initialized = True
+        except Exception as e:
+            logger.error(f"❌ Database initialization check failed: {e}", exc_info=True)
+            st.error(f"A critical error occurred while checking database status: {e}")
+            st.stop()
+
+# Call the initialization check at the start of the app
+ensure_database_initialized()
+
+try:
+    from src.gui.database_management_ui import render_database_management_ui
+    DATABASE_MANAGEMENT_AVAILABLE = True
+except ImportError as e:
+    DATABASE_MANAGEMENT_AVAILABLE = False
+
+# --- DATABASE SESSION MANAGER ---
+class DatabaseSessionManager:
+    """
+    Manages database sessions for Streamlit app to prevent 'too many clients' errors.
+    Uses connection pooling and proper session lifecycle management.
+    """
+    
+    def __init__(self):
+        self.session_pool = {}
+        self.max_sessions = 5  # Limit concurrent sessions
+        self.session_timeout = 300  # 5 minutes timeout
+        
+    @contextmanager
+    def get_managed_session(self, session_key: str = "default"):
+        """
+        Context manager that provides a database session with automatic cleanup.
+        Uses session pooling to prevent too many connections.
+        """
+        session = None
+        try:
+            # Check if we have a cached session
+            if session_key in st.session_state.get('db_sessions', {}):
+                session_info = st.session_state.db_sessions[session_key]
+                # Check if session is still valid and not timed out
+                if (datetime.now() - session_info['created']).seconds < self.session_timeout:
+                    session = session_info['session']
+                    # Test if session is still alive
+                    try:
+                        session.execute("SELECT 1")
+                        yield session
+                        return
+                    except Exception:
+                        # Session is dead, remove it and create new one
+                        try:
+                            session.close()
+                        except:
+                            pass
+                        del st.session_state.db_sessions[session_key]
+                        session = None
+                else:
+                    # Session timed out, clean it up
+                    try:
+                        session_info['session'].close()
+                    except:
+                        pass
+                    del st.session_state.db_sessions[session_key]
+                    session = None
+            
+            # Create new session if needed
+            if session is None:
+                session = get_session()
+                
+                # Initialize session cache if needed
+                if 'db_sessions' not in st.session_state:
+                    st.session_state.db_sessions = {}
+                
+                # Clean up old sessions if we have too many
+                if len(st.session_state.db_sessions) >= self.max_sessions:
+                    oldest_key = min(st.session_state.db_sessions.keys(), 
+                                   key=lambda k: st.session_state.db_sessions[k]['created'])
+                    try:
+                        st.session_state.db_sessions[oldest_key]['session'].close()
+                    except:
+                        pass
+                    del st.session_state.db_sessions[oldest_key]
+                
+                # Cache the new session
+                st.session_state.db_sessions[session_key] = {
+                    'session': session,
+                    'created': datetime.now()
+                }
+            
+            yield session
+            
+        except Exception as e:
+            if session:
+                try:
+                    session.rollback()
+                except:
+                    pass
+            raise e
+        finally:
+            # Don't close the session here - let it be reused
+            pass
+    
+    def cleanup_all_sessions(self):
+        """Clean up all cached database sessions."""
+        if 'db_sessions' in st.session_state:
+            for session_info in st.session_state.db_sessions.values():
+                try:
+                    session_info['session'].close()
+                except:
+                    pass
+            st.session_state.db_sessions = {}
+
+# Initialize the session manager
+if 'db_session_manager' not in st.session_state:
+    st.session_state.db_session_manager = DatabaseSessionManager()
+
+db_manager = st.session_state.db_session_manager
 
 # --- Global Variables & Session State ---
 if 'processing_stopped' not in st.session_state:
@@ -152,10 +257,6 @@ if 'processing_active' not in st.session_state:
     st.session_state.processing_active = False
 if 'auto_show_logs' not in st.session_state:
     st.session_state.auto_show_logs = False
-if 'live_logs' not in st.session_state:
-    st.session_state.live_logs = []
-if 'log_counter' not in st.session_state:
-    st.session_state.log_counter = 0
 if 'last_log_update' not in st.session_state:
     st.session_state.last_log_update = 0
 if 'ollama_models' not in st.session_state:
@@ -284,19 +385,14 @@ try:
             if DATABASE_MANAGEMENT_AVAILABLE:
                 # Database statistics
                 try:
-                    session = get_session()
-                    if session:
-                        from database_models import Project, Document, Client
+                    with db_manager.get_managed_session("sidebar_stats") as session:
                         project_count = session.query(Project).count()
-                        document_count = session.query(Document).count()
-                        client_count = session.query(Client).count()
-                        session.close()
+                        # document_count = session.query(Document).count() # Obsolete
+                        # client_count = session.query(Client).count() # Obsolete
                         
                         st.metric("Projects", project_count)
-                        st.metric("Documents", document_count)
-                        st.metric("Clients", client_count)
-                    else:
-                        st.error("Database connection failed")
+                        # st.metric("Documents", document_count)
+                        # st.metric("Clients", client_count)
                 except Exception as e:
                     st.error(f"Error: {str(e)[:50]}...")
                 
@@ -304,7 +400,7 @@ try:
                 st.markdown("**Database Operations:**")
                 if st.button("📤 Export All Data", help="Export database to CSV/JSON"):
                     try:
-                        from scripts.database_manager import DatabaseManager
+                        from src.scripts.database_manager import DatabaseManager
                         db_manager = DatabaseManager()
                         success = db_manager.export_all_formats()
                         if success:
@@ -326,7 +422,7 @@ try:
                 if st.button("🗑️ Wipe Database", disabled=not confirm_wipe, help="Delete all data"):
                     if confirm_wipe:
                         try:
-                            from scripts.database_manager import DatabaseManager
+                            from src.scripts.database_manager import DatabaseManager
                             db_manager = DatabaseManager()
                             success = db_manager.wipe_database(confirm=True)
                             if success:
@@ -345,7 +441,7 @@ try:
             st.markdown("### 🐳 Docker Management")
             
             try:
-                from scripts.docker_db_manager import DockerDBManager
+                from src.scripts.docker_db_manager import DockerDBManager
                 docker_manager = DockerDBManager()
                 docker_status = docker_manager.get_docker_status()
                 
@@ -897,11 +993,9 @@ with st.container():
         )
 
         if uploaded_file is not None:
-            # Create a temporary directory for the uploaded file if it doesn't exist
             temp_dir = Path(UPLOAD_FOLDER) / "temp_uploads"
             temp_dir.mkdir(parents=True, exist_ok=True)
             
-            # Save the uploaded file
             file_path = temp_dir / uploaded_file.name
             with open(file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
@@ -909,10 +1003,17 @@ with st.container():
             st.success(f"✅ File uploaded: {uploaded_file.name}")
             
             if st.session_state.ollama_models:
+                # Set the desired default model
+                preferred_model = "gemma3:12b"
+                model_options = st.session_state.ollama_models
+                default_index = 0
+                if preferred_model in model_options:
+                    default_index = model_options.index(preferred_model)
+
                 selected_model = st.selectbox(
                     "Select Ollama Model for Processing:", 
-                    st.session_state.ollama_models, 
-                    index=0, 
+                    model_options, 
+                    index=default_index, 
                     key="selected_model_single",
                     help="Choose the LLM model to use for document analysis and information extraction"
                 )
@@ -962,11 +1063,14 @@ with st.container():
                             unsafe_allow_html=True
                         )
                         
-                        process_documents(
-                            selected_llm_model=selected_model,
-                            filename=uploaded_file.name,
-                            upload_dir=str(temp_dir)
-                        )
+                        # Use the managed session from the UI for processing
+                        with db_manager.get_managed_session("single_file_processing") as process_session:
+                            process_documents(
+                                selected_llm_model=selected_model,
+                                filename=uploaded_file.name,
+                                upload_dir=str(temp_dir),
+                                db_session=process_session # Pass the session here
+                            )
                         logger.info(f"Successfully processed: {uploaded_file.name}")
                         
                         # Beautiful success animation
@@ -999,101 +1103,194 @@ with st.container():
     
     with process_tab2:
         st.markdown("### 📂 Process Multiple Files from Folder")
+        st.markdown("Select a folder containing documents (.pdf, .docx, .pptx) for batch processing.")
+
+        if 'custom_folder_path' not in st.session_state:
+            st.session_state.custom_folder_path = ""
+
         custom_folder_path = st.text_input(
-            "Enter full path to document folder:", 
-            key="custom_folder_path", 
-            placeholder="e.g., C:\\Users\\YourUser\\Documents\\ProjectFiles or /mnt/network_share/docs"
+            "Enter full path to document folder:",
+            value=st.session_state.custom_folder_path,
+            key="folder_path_input",
+            placeholder="e.g., C:\\Users\\YourUser\\Documents\\ProjectFiles"
         )
+        st.session_state.custom_folder_path = custom_folder_path
 
-        if st.session_state.ollama_models:
-            selected_model = st.selectbox(
-                "Select Ollama Model for Processing:", 
-                st.session_state.ollama_models, 
-                index=0, 
-                key="selected_model_folder",
-                help="Choose the LLM model to use for document analysis and information extraction"
-            )
+        if custom_folder_path and not Path(custom_folder_path).is_dir():
+            st.error("❌ The provided path is not a valid directory. Please check the path and try again.", icon="🚨")
+        elif custom_folder_path:
+            st.success(f"✅ Valid folder selected: {custom_folder_path}")
 
-            # Processing control buttons
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                start_button_disabled = not bool(custom_folder_path.strip()) if custom_folder_path else True
-                if st.button("▲ Start Processing", key="start_processing", disabled=start_button_disabled):
+            if st.session_state.ollama_models:
+                col1, col2 = st.columns([2,1])
+                with col1:
+                    # Set the desired default model
+                    preferred_model = "gemma3:12b"
+                    model_options = st.session_state.ollama_models
+                    default_index = 0
+                    if preferred_model in model_options:
+                        default_index = model_options.index(preferred_model)
+
+                    selected_model = st.selectbox(
+                        "Select Ollama Model for Processing:",
+                        model_options,
+                        index=default_index,
+                        key="selected_model_folder",
+                        help="Choose the LLM model for document analysis."
+                    )
+                with col2:
+                    num_workers = st.slider(
+                        "Parallel Processing Workers:", 
+                        min_value=1, 
+                        max_value=10, 
+                        value=4, 
+                        key="num_workers",
+                        help="Number of files to process in parallel. Increase for faster processing, but be mindful of system resources."
+                    )
+
+                def run_batch_processing(folder_path, model, workers):
+                    """Encapsulates the logic for running the batch processing."""
                     st.session_state.processing_stopped = False
                     st.session_state.processing_active = True
-                    st.session_state.auto_show_logs = True
-                    st.session_state.live_logs = [] # Clear logs from previous runs
-                    
-                    user_provided_path = custom_folder_path.strip()
-                    logger.info(f"Starting document processing with model: {selected_model}, folder: {user_provided_path}")
-                    
-                    discovered_files_info = find_project_files(user_provided_path, force_reprocess=True)
-                    
-                    if not discovered_files_info:
-                        logger.warning(f"No supported files found in the specified folder: {user_provided_path}")
-                        st.warning(f"No supported files (.pptx, .pdf, .docx) found in: {user_provided_path}")
+                    st.session_state.live_logs = []
+                    log_queue = Queue()
+
+                    user_provided_path = folder_path.strip()
+                    logger.info(f"Starting batch processing with model: {model}, folder: {user_provided_path}, workers: {workers}")
+
+                    path_to_scan = Path(user_provided_path)
+                    if not path_to_scan.is_dir():
+                        st.error(f"Error: The provided path is not a valid directory or is not accessible: {user_provided_path}", icon="🚫")
+                        logger.error(f"User provided an invalid or inaccessible directory: {user_provided_path}")
                         st.session_state.processing_active = False
-                    else:
-                        files_to_process_details = discovered_files_info
-                        st.session_state.total_files_to_process = len(files_to_process_details)
-                        st.session_state.processed_files_count = 0
-                        logger.info(f"Found {st.session_state.total_files_to_process} files to process in {user_provided_path}")
+                        return
 
-                        # Create containers for live updates (no dimming)
-                        progress_container = st.empty()
-                        status_container = st.empty()
-                        
-                        def stop_processing_callback():
-                            return st.session_state.processing_stopped
-
-                        for i, file_info_dict in enumerate(files_to_process_details):
-                            if st.session_state.processing_stopped:
-                                logger.info("Processing stopped by user.")
-                                break
-                            
-                            file_path_obj = file_info_dict["file_path"]
-                            filename = file_path_obj.name
-                            directory_of_file = str(file_path_obj.parent)
-
-                            st.session_state.current_doc_name = filename
-                            logger.info(f"Processing document: {filename} ({i+1}/{st.session_state.total_files_to_process})")
-                            
-                            st.session_state.processed_files_count = i + 1
-                            progress_percent = int((st.session_state.processed_files_count / st.session_state.total_files_to_process) * 100)
-                            
-                            # Update progress and status without dimming
-                            progress_container.progress(progress_percent, text=f"Processing: {filename}")
-                            status_container.info(f'🚀 Processing {filename} ({i+1}/{st.session_state.total_files_to_process})...')
-
-                            try:
-                                process_documents(
-                                    selected_llm_model=selected_model, 
-                                    filename=filename, 
-                                    stop_callback=stop_processing_callback,
-                                    upload_dir=directory_of_file
-                                )
-                                logger.info(f"Successfully processed: {filename}")
-                                status_container.success(f"✅ Completed: {filename}")
-                            except Exception as e:
-                                logger.error(f"Error processing {filename}: {e}", exc_info=True)
-                                status_container.error(f"❌ Error: {filename}")
-                        
-                        progress_container.empty()
-                        status_container.empty()
-                        st.session_state.current_doc_name = ""
+                    try:
+                        with st.spinner("Discovering processable files in the folder..."):
+                            files_to_process = find_project_files(user_provided_path, force_reprocess=True)
+                    except Exception as e:
+                        logger.error(f"An error occurred during file discovery in {user_provided_path}: {e}", exc_info=True)
+                        st.error(f"An unexpected error occurred while scanning the folder: {e}. Check logs for details.", icon="🔥")
                         st.session_state.processing_active = False
-                        if not st.session_state.processing_stopped:
-                            logger.info(f"All documents processed from {user_provided_path}.")
-                            st.success("◆ All documents processed successfully!")
+                        return
 
-            with col2:
-                if st.button("■ Stop Processing", key="stop_processing"):
-                    st.session_state.processing_stopped = True
+                    if not files_to_process:
+                        st.warning(f"No supported files (.pptx, .pdf, .docx) found in: {user_provided_path}", icon="ℹ️")
+                        logger.warning(f"No supported files found in: {user_provided_path}")
+                        st.session_state.processing_active = False
+                        return
+                    
+                    st.session_state.total_files_to_process = len(files_to_process)
+                    st.session_state.processed_files_count = 0
+                    st.session_state.processing_errors = []
+                    logger.info(f"Found {st.session_state.total_files_to_process} files to process.")
+
+                    progress_container = st.empty()
+                    status_container = st.empty()
+                    
+                    def process_single_doc_worker(file_info, log_queue, db_session):
+                        if st.session_state.get('processing_stopped', False):
+                            return "Skipped"
+                        
+                        file_path_obj = file_info["file_path"]
+                        filename = file_path_obj.name
+                        directory = str(file_path_obj.parent)
+
+                        # Reconfigure logging for this thread to be thread-safe
+                        root_logger = logging.getLogger()
+                        original_handlers = root_logger.handlers[:]
+                        
+                        # The main streamlit handler is not thread-safe, so we remove it
+                        # and use a queue handler to pass logs back to the main thread.
+                        thread_handlers = [h for h in original_handlers if h is not streamlit_handler]
+                        thread_handlers.append(QueueLogHandler(log_queue))
+                        root_logger.handlers = thread_handlers
+                        
+                        try:
+                            logger.info(f"Starting processing for: {filename}")
+                            # Pass the single, managed session to the processor
+                            process_documents(
+                                selected_llm_model=model,
+                                filename=filename,
+                                upload_dir=directory,
+                                db_session=db_session
+                            )
+                            logger.info(f"Successfully processed: {filename}")
+                            return "Success"
+                        except Exception as e:
+                            logger.error(f"Error processing {filename}: {e}", exc_info=True)
+                            st.session_state.processing_errors.append(filename)
+                            return "Error"
+                        finally:
+                            # Restore the original logging configuration for the root logger
+                            root_logger.handlers = original_handlers
+
+                    # Acquire a single session to be shared by all threads in the pool
+                    with db_manager.get_managed_session("batch_processing") as shared_db_session:
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            # Pass the shared session to each worker
+                            future_to_file = {executor.submit(process_single_doc_worker, file_info, log_queue, shared_db_session): file_info for file_info in files_to_process}
+                            
+                            for future in as_completed(future_to_file):
+                                # Process any logs that have been queued from the worker threads
+                                while not log_queue.empty():
+                                    try:
+                                        record = log_queue.get_nowait()
+                                        streamlit_handler.emit(record)
+                                    except Exception as e:
+                                        print(f"Error processing log queue: {e}")
+
+                                if st.session_state.get('processing_stopped', False):
+                                    break
+                                
+                                file_info = future_to_file[future]
+                                filename = file_info["file_path"].name
+                                st.session_state.processed_files_count += 1
+                                
+                                progress = st.session_state.processed_files_count / st.session_state.total_files_to_process
+                                progress_container.progress(progress, text=f"Processing: {filename} ({st.session_state.processed_files_count}/{st.session_state.total_files_to_process})")
+                                
+                                try:
+                                    result = future.result()
+                                    if result == "Success":
+                                        status_container.success(f"✅ Completed: {filename}", icon="🚀")
+                                    elif result == "Error":
+                                        status_container.warning(f"⚠️ Error processing: {filename}. See logs for details.", icon="🔥")
+                                except Exception as exc:
+                                    logger.error(f'{filename} generated an exception: {exc}')
+                                    status_container.error(f"❌ Critical error processing {filename}. Check logs.")
+
                     st.session_state.processing_active = False
-                    logger.warning("Stop signal received. Processing will halt after the current file.")
-        else:
-            st.warning("No Ollama models available. Cannot start processing.")
+                    total_processed = st.session_state.processed_files_count
+                    total_errors = len(st.session_state.processing_errors)
+                    
+                    st.balloons()
+                    st.success(f"🎉 **Batch Processing Complete!** 🎉")
+                    st.markdown(f"- **Total Files Processed:** {total_processed}")
+                    st.markdown(f"- **Successful:** {total_processed - total_errors}")
+                    if total_errors > 0:
+                        st.error(f"- **Errors:** {total_errors}")
+                        with st.expander("Files with errors:"):
+                            st.json(st.session_state.processing_errors)
+                    
+                    st.session_state.total_files_to_process = 0
+                    st.session_state.processed_files_count = 0
+                    st.session_state.processing_errors = []
+
+                # Processing control buttons
+                start_button_disabled = not bool(custom_folder_path.strip())
+                if st.button("🚀 Start Batch Processing", key="start_processing", disabled=start_button_disabled, use_container_width=True):
+                    run_batch_processing(custom_folder_path, selected_model, num_workers)
+
+            else:
+                st.warning("No Ollama models available. Cannot process folder.")
+                
+            with col2:
+                if st.session_state.get('processing_active', False):
+                    if st.button("🛑 Stop Processing", key="stop_processing", use_container_width=True):
+                        st.session_state.processing_stopped = True
+                        logger.warning("Stop processing signal received. Will stop after current files complete.")
+                        st.warning("🛑 Stopping... please wait for active files to finish.")
 
 # === SECTION 3: LIVE LOGS (Prominent Display) ===
 st.markdown("---")
@@ -1104,309 +1301,86 @@ with st.container():
     with st.expander("● Real-Time Process Logs", expanded=st.session_state.get('processing_active', False)):
         display_live_streaming_logs()
 
-# === SECTION 4: KNOWLEDGE BASE EXPLORER ===
+# === SECTION 4: PROJECT DATA VIEWER (REFACTORED) ===
 st.markdown("---")
 with st.container():
-    st.header("▧ Knowledge Base Explorer")
+    st.header("▧ Project Data Viewer")
+    st.markdown("Browse the aggregated text snippets for each project.")
 
-    # Create tabs for the explorer
-    kb_tab1, kb_tab2, kb_tab3 = st.tabs(["▤ Browse All Projects", "▣ Project Details", "▦ Processed Documents"])
-
-    with kb_tab1: # All Projects Tab
-        st.subheader("All Processed Projects")
-        
-        # Add toggle for view type
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            view_type = st.radio(
-                "Choose view type:",
-                ["▦ Simple View (Latest Log Only)", "⬢ Comprehensive View (All Content)"],
-                horizontal=True,
-                key="project_view_type"
-            )
-        with col2:
-            if st.button("⟲ Refresh Project List", key="refresh_projects_simple"):
-                if 'simple_projects_list' in st.session_state:
-                    del st.session_state.simple_projects_list
-                if 'comprehensive_projects_list' in st.session_state:
-                    del st.session_state.comprehensive_projects_list
-
-        # Determine which data to show
-        use_comprehensive = "Comprehensive" in view_type
-        
-        if use_comprehensive:
-            # Comprehensive view
-            if 'comprehensive_projects_list' not in st.session_state:
-                db_sess = None
-                try:
-                    db_sess = get_session()
-                    st.session_state.comprehensive_projects_list = get_comprehensive_project_list(db_sess)
-                except Exception as e:
-                    st.error(f"Error fetching comprehensive projects: {e}")
-                    st.session_state.comprehensive_projects_list = []
-                finally:
-                    if db_sess: db_sess.close()
+    try:
+        with db_manager.get_managed_session("project_viewer") as session:
             
-            projects_data = st.session_state.comprehensive_projects_list
-            if projects_data:
-                # Optimized column configuration for comprehensive view
-                st.dataframe(
-                    projects_data, 
-                    use_container_width=True, 
-                    height=500,
-                    column_config={
-                        "ID": st.column_config.NumberColumn("ID", width="small"),
-                        "Project Name": st.column_config.TextColumn("Project Name", width="medium"),
-                        "Created At": st.column_config.TextColumn("Created", width="small"),
-                        "Updated At": st.column_config.TextColumn("Updated", width="small"),
-                        "Total Logs": st.column_config.NumberColumn("Total Logs", width="small"),
-                        "All Log Titles": st.column_config.TextColumn("All Log Titles", width="medium"),
-                        "Comprehensive Content": st.column_config.TextColumn("Comprehensive Content", width="large")
-                    }
-                )
-                st.caption(f"⬢ **Comprehensive View**: Showing {len(projects_data)} projects with ALL extraction content aggregated. This includes data from all processed documents for each project.")
+            projects = session.query(Project).order_by(Project.category, Project.project_name).all()
+
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                if st.button("⟲ Refresh Project List", key="refresh_projects_new_view", use_container_width=True):
+                    st.rerun()
+
+            if not projects:
+                st.info("No projects found in the database. Process documents using the 'Document Processing' section above to get started.", icon="ℹ️")
             else:
-                st.info("No projects found in the database, or an error occurred.")
+                # Create two columns for cascading dropdowns
+                cat_select_col, proj_select_col = st.columns(2)
+
+                # Get unique categories, sorting them and placing "Uncategorized" at the end.
+                all_categories = sorted(list(set(p.category for p in projects if p.category)))
+                if any(p.category is None for p in projects):
+                    all_categories.append("Uncategorized")
                 
-        else:
-            # Simple view (existing functionality)
-            if 'simple_projects_list' not in st.session_state:
-                db_sess = None
-                try:
-                    db_sess = get_session()
-                    st.session_state.simple_projects_list = get_simple_project_list(db_sess)
-                except Exception as e:
-                    st.error(f"Error fetching projects: {e}")
-                    st.session_state.simple_projects_list = []
-                finally:
-                    if db_sess: db_sess.close()
-            
-            projects_data = st.session_state.simple_projects_list
-            if projects_data:
-                # Optimized column configuration for simple view
-                st.dataframe(
-                    projects_data, 
-                    use_container_width=True, 
-                    height=500,
-                    column_config={
-                        "ID": st.column_config.NumberColumn("ID", width="small"),
-                        "Project Name": st.column_config.TextColumn("Project Name", width="medium"),
-                        "Created At": st.column_config.TextColumn("Created", width="small"),
-                        "Updated At": st.column_config.TextColumn("Updated", width="small"),
-                        "Latest Log Title": st.column_config.TextColumn("Latest Log Title", width="medium"),
-                        "Latest Log Content": st.column_config.TextColumn("Latest Log Content", width="large")
-                    }
-                )
-                st.caption(f"▦ **Simple View**: Showing {len(projects_data)} projects with latest extraction log only. Switch to Comprehensive View to see all gathered content.")
-            else:
-                st.info("No projects found in the database, or an error occurred.")
+                with cat_select_col:
+                    selected_category = st.selectbox(
+                        "Filter by Category",
+                        options=all_categories
+                    )
 
-    with kb_tab2: # Project Details Tab
-        st.subheader("Detailed View: Project → Documents → Key Information")
-
-        # Fetch projects for dropdown if not already fetched by tab1 (or if tab1 failed)
-        if 'all_projects_data' not in st.session_state or not st.session_state.all_projects_data:
-            db_sess_tab2 = None
-            try:
-                db_sess_tab2 = get_session()
-                st.session_state.all_projects_data_tab2 = get_projects_for_display(db_sess_tab2) # Use a different key if needed or rely on tab1
-            except Exception as e:
-                st.error(f"Error fetching projects for selection: {e}")
-                st.session_state.all_projects_data_tab2 = []
-            finally:
-                if db_sess_tab2: db_sess_tab2.close()
-        else: # Use data possibly fetched by tab1 to avoid re-fetch unless forced
-            st.session_state.all_projects_data_tab2 = st.session_state.all_projects_data
-
-        if st.session_state.get('all_projects_data_tab2'):
-            project_names_map = {p["Project Name"]: p["ID"] for p in st.session_state.all_projects_data_tab2}
-            if not project_names_map: 
-                st.info("No projects available to select.")
-            else:
-                selected_project_name = st.selectbox(
-                    "Select a Project:", 
-                    options=list(project_names_map.keys()), 
-                    key="selected_project_for_details"
-                )
-
-                if selected_project_name:
-                    selected_project_id = project_names_map[selected_project_name]
-                    st.markdown(f"**Displaying details for Project: {selected_project_name} (ID: {selected_project_id})**")
-
-                    # --- Display Project Extraction Log ---
-                    st.markdown("---")
-                    st.markdown("### Project Extraction Log")
-                    log_expander = st.expander("View Full Extraction Log", expanded=False)
-                    with log_expander:
-                        if st.button("⟲ Refresh Extraction Log", key=f"refresh_extraction_log_{selected_project_id}"):
-                            session_key_log = f"extraction_log_for_project_{selected_project_id}"
-                            if session_key_log in st.session_state:
-                                del st.session_state[session_key_log]
-
-                        session_key_log = f"extraction_log_for_project_{selected_project_id}"
-                        if session_key_log not in st.session_state:
-                            db_sess_log = None
-                            try:
-                                db_sess_log = get_session()
-                                st.session_state[session_key_log] = get_project_extraction_logs(db_sess_log, selected_project_id)
-                            except Exception as e:
-                                st.error(f"Error fetching extraction log for project {selected_project_name}: {e}")
-                                st.session_state[session_key_log] = []
-                            finally:
-                                if db_sess_log: db_sess_log.close()
-                        
-                        extraction_log_data = st.session_state.get(session_key_log, [])
-                        if extraction_log_data:
-                            # Prepare data for st.dataframe
-                            logs_for_df = []
-                            for log_item in extraction_log_data:
-                                logs_for_df.append({
-                                    "Timestamp": log_item.log_entry_timestamp.strftime('%Y-%m-%d %H:%M:%S %Z') if log_item.log_entry_timestamp else 'N/A',
-                                    "Title": log_item.log_entry_title or 'N/A',
-                                    "Source Document": log_item.source_document_name or 'N/A',
-                                    "LLM Action": log_item.llm_verification_action or 'N/A',
-                                    "LLM Confidence": f"{log_item.llm_verification_confidence:.2f}" if log_item.llm_verification_confidence is not None else 'N/A',
-                                    "LLM Reasoning": log_item.llm_verification_reasoning or 'N/A',
-                                    "Content": log_item.log_entry_content # Full content
-                                })
-                            
-                            if logs_for_df:
-                                st.dataframe(logs_for_df, use_container_width=True)
-                            else:
-                                st.info("No extraction log entries to display in table format.")
-                        else:
-                            st.info("No extraction log entries found for this project.")
-
-                    # Display Documents for the selected project
-                    st.markdown("---")
-                    st.markdown("**Documents in this Project:**")
-                    if st.button("⟲ Refresh Documents", key=f"refresh_docs_{selected_project_id}"):
-                        session_key_docs = f'documents_for_project_{selected_project_id}'
-                        if session_key_docs in st.session_state: del st.session_state[session_key_docs]
-
-                    session_key_docs = f'documents_for_project_{selected_project_id}'
-                    if session_key_docs not in st.session_state:
-                        db_sess_docs = None
-                        try:
-                            db_sess_docs = get_session()
-                            st.session_state[session_key_docs] = get_documents_for_project(db_sess_docs, selected_project_id)
-                        except Exception as e:
-                            st.error(f"Error fetching documents for project {selected_project_name}: {e}")
-                            st.session_state[session_key_docs] = []
-                        finally:
-                            if db_sess_docs: db_sess_docs.close()
-                    
-                    documents_data = st.session_state.get(session_key_docs, [])
-                    if documents_data:
-                        docs_df = st.dataframe(documents_data, use_container_width=True, key=f"docs_df_{selected_project_id}")
-                        
-                        doc_names_map = {d["File Name"]: d["document_id"] for d in documents_data}
-                        if doc_names_map:
-                            selected_doc_name = st.selectbox(
-                                "Select a Document to view its Key Information:",
-                                options=list(doc_names_map.keys()),
-                                key=f"selected_doc_for_key_info_{selected_project_id}"
-                            )
-                            if selected_doc_name:
-                                selected_doc_id = doc_names_map[selected_doc_name]
-                                
-                                st.markdown(f"**Extracted Key Information from: {selected_doc_name} (Doc ID: {selected_doc_id})**")
-                                st.warning("▣ **Note:** Detailed structured key information (from the `ProjectKeyInformation` table) is currently suspended. Raw LLM outputs for this document (and others for this project) are captured in the 'Project Extraction Log' displayed above.", icon="▣")
-                                
-                                if st.button("⟲ Refresh Key Info (Old System)", key=f"refresh_keyinfo_{selected_doc_id}"):
-                                    session_key_ki = f'keyinfo_for_doc_{selected_doc_id}'
-                                    if session_key_ki in st.session_state: del st.session_state[session_key_ki]
-
-                                session_key_ki = f'keyinfo_for_doc_{selected_doc_id}'
-                                if session_key_ki not in st.session_state:
-                                    db_sess_ki = None
-                                    try:
-                                        db_sess_ki = get_session()
-                                        st.session_state[session_key_ki] = get_key_info_for_document(db_sess_ki, selected_doc_id)
-                                    except Exception as e:
-                                        st.error(f"Error fetching key info for document {selected_doc_name}: {e}")
-                                        st.session_state[session_key_ki] = []
-                                    finally:
-                                        if db_sess_ki: db_sess_ki.close()
-                                
-                                key_info_data = st.session_state.get(session_key_ki, [])
-                                if key_info_data:
-                                    st.dataframe(key_info_data, use_container_width=True, key=f"keyinfo_df_{selected_doc_id}")
-                                else:
-                                    st.info("No key information extracted or found for this document.")
-                        else:
-                            st.info("No documents available to select key info from.")
-                    else:
-                        st.info("No documents found for this project.")
-        else:
-            st.info("No projects available to select from. Process some documents first or check database connection.")
-
-    with kb_tab3: # View Processed Documents Tab
-        st.subheader("All Processed Documents")
-
-        col1, col2 = st.columns([3,1])
-        with col1:
-            search_term = st.text_input("Search Processed Documents (by File Name, Type, or Project ID):", key="processed_docs_search")
-        with col2:
-            if st.button("⟲ Refresh List", key="refresh_processed_docs_new_button"):
-                st.session_state.processed_docs_list = None # Clear cache to force refresh
-
-        if 'processed_docs_list' not in st.session_state or st.session_state.processed_docs_list is None:
-            db_session = None
-            try:
-                db_session = get_session()
-                if db_session:
-                    st.session_state.processed_docs_list = get_processed_documents(db_session)
+                # Filter projects based on the selected category
+                if selected_category == "Uncategorized":
+                    projects_in_category = [p for p in projects if p.category is None]
                 else:
-                    st.session_state.processed_docs_list = []
-                    st.error("Failed to connect to the database to fetch processed documents.")
-                    st.session_state.db_connection_error_processed_docs = True
-            except Exception as e:
-                st.session_state.processed_docs_list = []
-                logger.error(f"Error fetching processed documents: {e}", exc_info=True)
-                st.error(f"An error occurred while fetching processed documents: {e}")
-                st.session_state.db_connection_error_processed_docs = True
-            finally:
-                if db_session:
-                    db_session.close()
-        
-        if 'db_connection_error_processed_docs' not in st.session_state:
-            st.session_state.db_connection_error_processed_docs = False
+                    projects_in_category = [p for p in projects if p.category == selected_category]
 
-        processed_docs_full_list = st.session_state.get('processed_docs_list', [])
-        
-        filtered_docs = processed_docs_full_list
-        if search_term:
-            search_term_lower = search_term.lower()
-            filtered_docs = [
-                doc for doc in processed_docs_full_list
-                if search_term_lower in str(doc.get("File Name", "")).lower() or \
-                   search_term_lower in str(doc.get("Type", "")).lower() or \
-                   search_term_lower in str(doc.get("Project ID", "")).lower()
-            ]
+                project_map = {p.project_name: p for p in projects_in_category}
 
-        if filtered_docs:
-            st.dataframe(
-                filtered_docs, 
-                use_container_width=True, 
-                height=600,
-                column_config={
-                    "document_id": st.column_config.NumberColumn("Doc ID", width="small"),
-                    "File Name": st.column_config.TextColumn("File Name", width="large"),
-                    "Type": st.column_config.TextColumn("Type", width="small"),
-                    "Extraction Status": st.column_config.TextColumn("Status", width="medium"),
-                    "Processed At": st.column_config.TextColumn("Processed At", width="medium"),
-                    "Pages/Slides": st.column_config.NumberColumn("Pages", width="small"),
-                    "Project ID": st.column_config.NumberColumn("Project ID", width="small")
-                }
-            )
-            st.caption(f"Showing {len(filtered_docs)} of {len(processed_docs_full_list)} processed documents. Click column headers to sort.")
-        elif search_term and not filtered_docs:
-            st.info(f"No processed documents found matching your search term: '{search_term}'.")
-        elif not processed_docs_full_list and not st.session_state.db_connection_error_processed_docs:
-            st.info("No processed documents found in the database.")
-        elif not processed_docs_full_list and st.session_state.db_connection_error_processed_docs:
-            pass
+                with proj_select_col:
+                    # Only show project dropdown if there are projects in the selected category
+                    if project_map:
+                        selected_project_name = st.selectbox(
+                            "Select Project",
+                            options=list(project_map.keys())
+                        )
+                    else:
+                        selected_project_name = None
+                        st.write("No projects in this category.")
+
+                # Get the selected project object
+                if selected_project_name:
+                    selected_project = project_map[selected_project_name]
+                    
+                    # Display the full categorization for the selected project
+                    st.markdown("---")
+                    cat_disp_col, sub_cat_col, scope_col = st.columns(3)
+                    with cat_disp_col:
+                        st.metric("Category", selected_project.category or "N/A")
+                    with sub_cat_col:
+                        st.metric("Sub-Category", selected_project.sub_category or "N/A")
+                    with scope_col:
+                        st.metric("Project Scope", selected_project.project_scope or "N/A")
+                    st.markdown("---")
+
+                    project_data = selected_project.aggregated_data
+                    
+                    st.markdown(f"####  Aggregated Data for: **{selected_project.project_name}**")
+                    st.text_area(
+                        label="Scroll through the collected text snippets below.",
+                        value=project_data or "No data has been aggregated for this project yet.",
+                        height=600,
+                        disabled=True,
+                        key=f"data_for_{selected_project.project_name}"
+                    )
+    except Exception as e:
+        logger.error(f"Failed to load Project Data Viewer: {e}", exc_info=True)
+        st.error(f"An error occurred while loading project data: {e}", icon="🔥")
 
 # === SECTION 5: DATABASE MANAGEMENT ===
 st.markdown("---")
@@ -1430,26 +1404,51 @@ with st.container():
             
             # Basic statistics
             try:
-                session = get_session()
-                from database_models import Project, Document, Client
-                
-                project_count = session.query(Project).count()
-                document_count = session.query(Document).count()
-                client_count = session.query(Client).count()
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Projects", project_count)
-                with col2:
-                    st.metric("Documents", document_count)
-                with col3:
-                    st.metric("Clients", client_count)
-                
-                session.close()
+                with db_manager.get_managed_session("fallback_stats") as session:
+                    project_count = session.query(Project).count()
+                    # document_count = session.query(Document).count() # Obsolete
+                    # client_count = session.query(Client).count() # Obsolete
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Projects", project_count)
+                    with col2:
+                        st.metric("Documents", 0) # Placeholder
+                    with col3:
+                        st.metric("Clients", 0) # Placeholder
             except Exception as e:
                 st.error(f"Error getting database statistics: {e}")
         else:
             st.error(f"🔴 Database Connection: {db_message}")
+
+# --- DEBUGGING SECTION ---
+st.markdown("---")
+with st.expander("🔬 Debug & System Info"):
+    st.subheader("Raw Project Database View")
+    try:
+        with db_manager.get_managed_session("debug_raw_view") as session:
+            all_projects_data = session.query(Project).all()
+            if all_projects_data:
+                # Convert to a list of dictionaries for pandas
+                data_for_df = [
+                    {
+                        "ID": p.project_id,
+                        "Name": p.project_name,
+                        "Category": p.category,
+                        "Sub-Category": p.sub_category,
+                        "Scope": p.project_scope,
+                        "Updated": p.updated_at.strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    for p in all_projects_data
+                ]
+                import pandas as pd
+                df = pd.DataFrame(data_for_df)
+                st.dataframe(df)
+            else:
+                st.write("No projects in the database to display.")
+    except Exception as e:
+        st.error(f"Error loading debug view: {e}")
+
 
 # Footer or other sections
 st.markdown("---")
